@@ -1,0 +1,586 @@
+rules_version = '2';
+
+// =============================================================================
+// Firestore Security Rules — Travel Agency Management
+//
+// This mirrors, on the server, what the app's client-side code (lib/auth.js,
+// lib/permissions.js, lib/license.js) already assumes is being enforced.
+// Several code comments in this project literally say "see the Firestore
+// rule" — this file is that rule. Before this file existed, every one of
+// those checks was UI-only and could be bypassed by anyone with browser
+// devtools and the Firebase client config (which ships in the JS bundle by
+// design — that's normal for Firebase, it's *these* rules that are the real
+// gate, not the config being secret).
+//
+// Known, accepted simplifications (see chat reply for details):
+//   - Per-employee "only see my own bookings" (userData.onlyOwnData) IS now
+//     enforced here, via the immutable salesmanUid stamped on every booking
+//     at creation (see restrictedToOwn/ownsBooking below). Bookings created
+//     before salesmanUid existed have none, so they fall back to comparing
+//     salesmanName with the user's own name — same rule the UI uses. This
+//     is still an approximation for THOSE old records specifically (wrong
+//     if a name was ever edited, or shared by two employees) — Settings >
+//     Employees > "Repair Booking Ownership" fills in the real salesmanUid
+//     wherever the match is unambiguous, but run it and re-check rather
+//     than assuming it reached every record.
+// FIXED (previously listed here as an accepted simplification): the
+// unauthenticated username->email lookup used to run a `list` query
+// against the full /users collection, exposing each matching document's
+// entire content — including totpSecret — to anyone who knew or guessed a
+// valid username, while signed out. It now reads a minimal public mirror,
+// /usernames/{username} => {email, uid}, kept in sync by
+// register()/updateUser() in lib/auth.js. See that collection's rule
+// below and findEmailByUsername()'s comment in lib/auth.js.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function hasProfile() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    // NOTE: repeated calls to get() for the SAME document within one rule
+    // evaluation are de-duplicated by Firestore and only count once against
+    // the per-request get()/exists() limit — so it's safe for many helpers
+    // below to each call me() independently.
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function myRole() {
+      return hasProfile() ? me().role : null;
+    }
+
+    // Mirrors ADMIN_LEVEL_ROLES in lib/auth.js.
+    function isAdminLevel() {
+      return hasProfile() && myRole() in ['Admin', 'General Manager'];
+    }
+
+    // Mirrors userData?.role === "Admin" (isTrueAdmin in lib/auth.js) — the
+    // one tier above General Manager, used for App Features + license.
+    function isTrueAdmin() {
+      return hasProfile() && myRole() == 'Admin';
+    }
+
+    // Mirrors canManageLicense() in lib/license.js.
+    function isSuperAdmin() {
+      return hasProfile() && me().get('isSuperAdmin', false) == true;
+    }
+
+    // Mirrors PERMISSION_MODULES[].defaultRoles in lib/permissions.js.
+    // Keep this in sync by hand if that file changes — rules can't import it.
+    function defaultRoles(moduleKey) {
+      return moduleKey == 'dashboard'       ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'clients'         ? ['Manager', 'Accountant'] :
+             // Employees get default READ access here (see readOnlyForRole()
+             // just below) — kept in sync with lib/permissions.js's
+             // `corporates` entry, which also lists "Employee".
+             moduleKey == 'corporates'      ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'suppliers'       ? ['Manager', 'Accountant'] :
+             moduleKey == 'invoices'        ? ['Manager', 'Accountant'] :
+             moduleKey == 'flights'         ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'hotels'          ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'visa'            ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'transportation'  ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'files'           ? ['Manager', 'Accountant', 'Employee'] :
+             moduleKey == 'accounts'        ? ['Manager', 'Accountant'] :
+             moduleKey == 'fiscalYear'      ? ['Accountant'] :
+             moduleKey == 'analysis'        ? ['Manager', 'Accountant'] :
+             [];
+    }
+
+    // Settings > Permissions saves `customPermissions: null` (not a missing
+    // field) whenever "Use custom permissions" is unchecked, so the field
+    // EXISTS and is null on any employee whose permissions were ever opened
+    // and saved. `'customPermissions' in me()` was therefore true, and the
+    // next step tried `moduleKey in null` — an evaluation error, which
+    // Firestore treats as deny. Net effect: saving an employee's
+    // permissions with the checkbox off silently locked them out of
+    // everything server-side while the UI still showed the pages.
+    // These two helpers coerce a missing OR null value to an empty map, so
+    // the fallback to defaultRoles() happens like the client does it.
+    function customRead() {
+      return me().get('customPermissions', {}) is map ? me().customPermissions : {};
+    }
+
+    function customWrite() {
+      return me().get('customWritePermissions', {}) is map ? me().customWritePermissions : {};
+    }
+
+    // Mirrors canAccessModule() in lib/permissions.js (minus the appFeatures
+    // global kill-switch, which is a UX nicety, not a security boundary —
+    // it's fine for the rule to allow what the UI happens to be hiding).
+    function canAccess(moduleKey) {
+      return isAdminLevel() || (
+        hasProfile() && (
+          (moduleKey in customRead())
+            ? customRead()[moduleKey] == true
+            : myRole() in defaultRoles(moduleKey)
+        )
+      );
+    }
+
+    // Mirrors canWriteModule() in lib/permissions.js.
+    function canWrite(moduleKey) {
+      return isAdminLevel() || (
+        canAccess(moduleKey) && (
+          (moduleKey in customWrite())
+            ? customWrite()[moduleKey] == true
+            : !readOnlyForRole(moduleKey)
+        )
+      );
+    }
+
+    // Mirrors PERMISSION_MODULES[].readOnlyRoles in lib/permissions.js — a
+    // role can be given default READ access to a module without also
+    // getting default WRITE access (e.g. every Employee can see the
+    // Corporates list to pick one while booking, but can't add/edit one
+    // unless an Admin explicitly turns write on for them in Settings >
+    // Employees > Permissions, via customWrite() above). Without this,
+    // widening defaultRoles('corporates') to include 'Employee' would have
+    // silently handed every employee full write access too — the read-only
+    // restriction only existed in the UI, not on the server.
+    function readOnlyForRole(moduleKey) {
+      return moduleKey == 'corporates' && myRole() == 'Employee';
+    }
+
+    // Convenience: true if the caller can WRITE at least one of the four
+    // booking sections, or the Invoices/Accounts modules — used for shared
+    // resources like invoiceGroups that any of those flows can touch.
+    function canTouchAnyBookingOrInvoices() {
+      return canWrite('flights') || canWrite('hotels') || canWrite('visa') ||
+             canWrite('transportation') || canWrite('invoices');
+    }
+
+    // Mirrors isBranchVisible() in lib/helpers.js. Admins reach every
+    // branch; everyone else only their assigned branches.
+    // Same null-safety note as customRead() above: an employee saved with no
+    // branches can have `branches: null` rather than a missing field, and
+    // `x in null` is an evaluation error (= deny), not `false`.
+    function myBranches() {
+      return me().get('branches', []) is list ? me().branches : [];
+    }
+
+    function inMyBranch(branchField) {
+      return isAdminLevel() || (hasProfile() && branchField in myBranches());
+    }
+
+    // ---------------------------------------------------------------------
+    // "Only see own work" (userData.onlyOwnData, set in Settings >
+    // Permissions). When on, this employee only reaches bookings they are
+    // the salesman on — not their colleagues' records, even in their own
+    // branch. Admin-level roles are never restricted.
+    // ---------------------------------------------------------------------
+
+    function restrictedToOwn() {
+      return hasProfile() && !isAdminLevel() && me().get('onlyOwnData', false) == true;
+    }
+
+    // `data` is either resource.data (existing doc) or request.resource.data
+    // (the doc being written). The two different sentinel strings stop a
+    // record with no salesmanName matching a user doc with no name.
+    function ownsBooking(data) {
+      return data.get('salesmanUid', '') == request.auth.uid ||
+        (data.get('salesmanUid', '') == '' &&
+         data.get('salesmanName', '__no_owner__') == me().get('name', '__no_name__'));
+    }
+
+    function bootstrapped() {
+      return exists(/databases/$(database)/documents/system/bootstrap);
+    }
+
+    // ---------------------------------------------------------------------
+    // Booking sections (Flights / Hotels / Visa / Transportation)
+    //
+    // Shared invariants, matching the app fixes made this session:
+    //   - Once invoiceIssued == true, only an Admin/General Manager, or an
+    //     explicitly editUnlocked==true record, may be edited further.
+    //   - A small set of "invoice-controlled" fields can only move via the
+    //     Issue Invoice flow (requires write access to this section) or the
+    //     Cancel/Unlock flow (Admin-level only) — never as a side effect of
+    //     an ordinary field edit.
+    //   - Deleting a booking that has ever been issued an invoice is never
+    //     allowed, by anyone — it must be cancelled (Invoices > Cancel
+    //     Invoice) first, which reopens it and clears invoiceIssued.
+    // ---------------------------------------------------------------------
+
+    function issueControlledKeys() {
+      return ['invoiceIssued', 'invoiceNumber', 'numberPrefix', 'sequentialNumber', 'invoiceGroupId'];
+    }
+
+    function adminOnlyInvoiceKeys() {
+      return ['cancelledInvoiceNumber', 'cancelledNumberPrefix', 'cancelledSequentialNumber',
+              'invoiceCancelledAt', 'invoiceCancelledBy', 'invoiceCancelReason',
+              'editUnlockedBy', 'editUnlockedAt'];
+    }
+
+    function touchesAny(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny(keys);
+    }
+
+    // editUnlocked flipping from not-true to true is an admin-only grant;
+    // flipping back to false (re-lock on save) is allowed for anyone who
+    // can otherwise write this record — that's the normal "save after being
+    // unlocked" path, done by the employee who was granted access.
+    function unlockBeingGranted() {
+      return resource.data.get('editUnlocked', false) != true &&
+             request.resource.data.get('editUnlocked', false) == true;
+    }
+
+    function bookingCurrentlyLocked() {
+      return resource.data.get('invoiceIssued', false) == true &&
+             resource.data.get('editUnlocked', false) != true;
+    }
+
+    function bookingInvoiceGuardOk(moduleKey) {
+      return (!touchesAny(adminOnlyInvoiceKeys()) || isAdminLevel())
+          && (!unlockBeingGranted() || isAdminLevel())
+          && (!touchesAny(issueControlledKeys()) || canWrite(moduleKey));
+    }
+
+    function bookingCreateOk(moduleKey) {
+      return hasProfile()
+        && canWrite(moduleKey)
+        && inMyBranch(request.resource.data.get('branch', '1'))
+        // A record can never be born already-invoiced — invoices are only
+        // ever issued afterwards, through the numbering flow.
+        && request.resource.data.get('invoiceIssued', false) == false
+        // A restricted employee can only create bookings owned by themselves
+        // — otherwise they could file work under someone else's name and
+        // then lose sight of it.
+        && (!restrictedToOwn() || request.resource.data.get('salesmanUid', '') == request.auth.uid);
+    }
+
+    function bookingReadOk(moduleKey) {
+      return hasProfile()
+        && inMyBranch(resource.data.get('branch', '1'))
+        && (!restrictedToOwn() || ownsBooking(resource.data))
+        && (canAccess(moduleKey) || canAccess('accounts') || canAccess('invoices') ||
+            canAccess('analysis') || canAccess('dashboard'));
+    }
+
+    function bookingUpdateOk(moduleKey) {
+      return hasProfile()
+        && canWrite(moduleKey)
+        && inMyBranch(resource.data.get('branch', '1'))
+        && inMyBranch(request.resource.data.get('branch', '1'))
+        && (isAdminLevel() || !bookingCurrentlyLocked())
+        // A restricted employee may only edit their own bookings, and may
+        // never hand one to someone else (or claim someone else's) by
+        // rewriting salesmanUid. Nobody below Admin level reassigns owners.
+        && (!restrictedToOwn() || (ownsBooking(resource.data) &&
+             request.resource.data.get('salesmanUid', '') == resource.data.get('salesmanUid', '')))
+        && bookingInvoiceGuardOk(moduleKey);
+    }
+
+    function bookingDeleteOk(moduleKey) {
+      return isAdminLevel() && resource.data.get('invoiceIssued', false) != true;
+    }
+
+    match /flights/{id} {
+      allow read:   if bookingReadOk('flights');
+      allow create: if bookingCreateOk('flights');
+      allow update: if bookingUpdateOk('flights');
+      allow delete: if bookingDeleteOk('flights');
+    }
+    match /hotels/{id} {
+      allow read:   if bookingReadOk('hotels');
+      allow create: if bookingCreateOk('hotels');
+      allow update: if bookingUpdateOk('hotels');
+      allow delete: if bookingDeleteOk('hotels');
+    }
+    match /visa/{id} {
+      allow read:   if bookingReadOk('visa');
+      allow create: if bookingCreateOk('visa');
+      allow update: if bookingUpdateOk('visa');
+      allow delete: if bookingDeleteOk('visa');
+    }
+    match /transportation/{id} {
+      allow read:   if bookingReadOk('transportation');
+      allow create: if bookingCreateOk('transportation');
+      allow update: if bookingUpdateOk('transportation');
+      allow delete: if bookingDeleteOk('transportation');
+    }
+
+    // ---------------------------------------------------------------------
+    // Invoices (manual/misc entries) + the invoiceGroups audit doc written
+    // whenever InvoiceIssueModal bundles several bookings under one number.
+    // ---------------------------------------------------------------------
+
+    match /invoices/{id} {
+      allow read:   if hasProfile() && (canAccess('invoices') || isAdminLevel());
+      allow create: if hasProfile() && canWrite('invoices');
+      allow update: if hasProfile() && canWrite('invoices');
+      allow delete: if isAdminLevel() && resource.data.get('invoiceIssued', false) != true;
+    }
+
+    match /invoiceGroups/{id} {
+      allow read:   if hasProfile() && (canTouchAnyBookingOrInvoices() || isAdminLevel());
+      allow create: if hasProfile() && canTouchAnyBookingOrInvoices();
+      // Only status/cancellation metadata is ever updated on an existing
+      // group (see Cancel Invoice) — allow it for the same audience.
+      allow update: if hasProfile() && canTouchAnyBookingOrInvoices();
+      // Never deleted by the app — it's the permanent audit record.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // CRM — Clients / Corporates / Suppliers. Company-wide, not
+    // branch-scoped (no `branch` field is used on these in the app).
+    // ---------------------------------------------------------------------
+
+    match /clients/{id} {
+      allow read:   if hasProfile() && canAccess('clients');
+      allow write:  if hasProfile() && canWrite('clients');
+    }
+    match /corporates/{id} {
+      allow read:   if hasProfile() && canAccess('corporates');
+      allow write:  if hasProfile() && canWrite('corporates');
+    }
+    match /suppliers/{id} {
+      allow read:   if hasProfile() && canAccess('suppliers');
+      allow write:  if hasProfile() && canWrite('suppliers');
+    }
+
+    // ---------------------------------------------------------------------
+    // Files
+    // ---------------------------------------------------------------------
+
+    match /files/{id} {
+      allow read:   if hasProfile() && canAccess('files');
+      allow write:  if hasProfile() && canWrite('files');
+    }
+
+    // ---------------------------------------------------------------------
+    // Accounting — Journals & Bank Book (Accounts module). The four booking
+    // collections above are Accounts' main data source and are covered by
+    // bookingReadOk() already (canAccess('accounts') is one of the allowed
+    // reasons to read them).
+    // ---------------------------------------------------------------------
+
+    match /journalEntries/{id} {
+      allow read:   if hasProfile() && canAccess('accounts');
+      allow write:  if hasProfile() && canWrite('accounts');
+    }
+    match /bankBook/{id} {
+      allow read:   if hasProfile() && canAccess('accounts');
+      allow write:  if hasProfile() && canWrite('accounts');
+    }
+
+    // ---------------------------------------------------------------------
+    // Treasury — أوامر/سندات التوريد والصرف (lib/treasury.js,
+    // components/TreasuryTab.js). Same module gate as journalEntries/
+    // bankBook above: it's a tab inside Accounts, not a separate
+    // permission. treasuryBalances is written only via the atomic
+    // runTransaction in postTreasuryVoucher()/voidTreasuryVoucher(), never
+    // directly from the UI, but the rule still needs to allow it since
+    // Firestore transactions run with the client's own credentials.
+    // ---------------------------------------------------------------------
+
+    match /treasuryVouchers/{id} {
+      allow read:   if hasProfile() && canAccess('accounts');
+      allow write:  if hasProfile() && canWrite('accounts');
+    }
+    match /treasuryBalances/{id} {
+      allow read:   if hasProfile() && canAccess('accounts');
+      allow write:  if hasProfile() && canWrite('accounts');
+    }
+
+    // ---------------------------------------------------------------------
+    // Fiscal Years — closing/reopening years. Read is intentionally broad:
+    // isRowClosed() (lib/fiscalYear.js) is consulted from almost every page
+    // to decide what to hide, so every signed-in app user needs to read it.
+    // ---------------------------------------------------------------------
+
+    match /fiscalYears/{id} {
+      allow read:   if hasProfile();
+      allow write:  if hasProfile() && canWrite('fiscalYear');
+    }
+
+    // ---------------------------------------------------------------------
+    // Counters — atomic invoice-number / Reg-Nr sequences
+    // (lib/helpers.js: generateInvoiceNumber / Reg-Nr generators).
+    // Whoever can write a booking or issue an invoice needs to be able to
+    // read+write these via runTransaction; nobody else needs them at all.
+    // ---------------------------------------------------------------------
+
+    match /counters/{id} {
+      // canWrite('accounts') added so treasury voucher numbering
+      // (generateVoucherNumber() in lib/treasury.js, same counters/
+      // transaction pattern as generateInvoiceNumber/generateRegNumber)
+      // works for an Accountant who only has the Accounts module —
+      // canTouchAnyBookingOrInvoices() alone doesn't cover that role.
+      allow read, write: if hasProfile() && (
+        canTouchAnyBookingOrInvoices() || canWrite('accounts') || isAdminLevel()
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Branches — read by everyone signed in (branch switcher, Admin branch
+    // picker); only Admin-level manages the list itself (Settings > Branches
+    // is hard-locked to Admin-level roles, not a customizable permission).
+    // ---------------------------------------------------------------------
+
+    match /branches/{id} {
+      allow read:   if hasProfile();
+      allow write:  if isAdminLevel();
+    }
+
+    // ---------------------------------------------------------------------
+    // Settings — global App Features toggles + license doc.
+    // ---------------------------------------------------------------------
+
+    match /settings/appFeatures {
+      allow read:  if hasProfile();
+      // Mirrors updateAppFeatures() in lib/auth.js: true Admin only, not
+      // General Manager, even though GM is otherwise Admin-level everywhere.
+      allow write: if isTrueAdmin();
+    }
+
+    // Company Profile (name/logo/contact) stamped on every printout.
+    // Everyone signed in needs to read it (it's rendered into print
+    // windows from any page); only Admin-level roles may change it.
+    match /settings/companyProfile {
+      allow read:  if hasProfile();
+      allow write: if isAdminLevel();
+    }
+
+    // Verbatim from README-LICENSE.md's documented rule — the license
+    // system's real enforcement layer. Super-admin (manually flagged,
+    // never via the app) or the agency's own Admin role may write; anyone
+    // may read so the LicenseGate lock-screen works for everyone,
+    // including signed-out visitors hitting the login page.
+    match /system/license {
+      allow read: if true;
+      allow write: if isSuperAdmin() || isTrueAdmin();
+    }
+
+    match /system/bootstrap {
+      // Public on purpose: its own EXISTENCE (not its content, which is
+      // just {createdAt, createdBy}) is what the sign-out login page uses
+      // to decide "show first-time setup" vs "show the login form" — see
+      // the fix note in app/(auth)/login/page.js. That used to be done by
+      // querying /users with limit(1) and checking .empty, which — same
+      // class of bug as the username lookup above — downloaded one
+      // arbitrary employee's ENTIRE profile (incl. totpSecret) to every
+      // anonymous visitor who ever loaded the login page, username or not.
+      allow read:   if true;
+      // Exactly one writer, ever: whoever's registration call in
+      // lib/auth.js wins the race to create this doc right after creating
+      // the very first Admin account. After that it exists forever.
+      allow create: if isSignedIn() && !bootstrapped();
+      allow update, delete: if false;
+    }
+
+    // Any other /system/* doc: nobody by default. Add an explicit match
+    // above (like license/bootstrap) if the app grows a new one.
+    match /system/{docId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Users
+    // ---------------------------------------------------------------------
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdminLevel());
+
+      // Both flows that used to need an unauthenticated/limited list here —
+      // username -> email lookup and the "does any user exist yet"
+      // first-time-setup check — now read the dedicated, minimal
+      // /usernames and /system/bootstrap docs instead (see those rules
+      // below), so nobody needs to list /users without being Admin-level
+      // any more. Settings > Employees is the only remaining caller, and
+      // it's Admin-level-only in the app.
+      allow list: if isAdminLevel();
+
+      // Bootstrap: the very first Admin, created before any /users doc
+      // exists, is the one case where a signed-in-but-unprivileged user
+      // may create their OWN doc. Every other creation (adding an
+      // employee) must come from an existing Admin-level account.
+      allow create: if isSignedIn() && (
+        (request.auth.uid == userId && !bootstrapped()) || isAdminLevel()
+      );
+
+      // A user may update a narrow, non-privileged slice of their own doc
+      // (heartbeat, their own 2FA enrollment, the one-time OTP prompt
+      // flag) — never their own role, branches, or permissions. Anything
+      // else requires Admin-level (Settings > Employees).
+      allow update: if isSignedIn() && (
+        isAdminLevel() ||
+        (request.auth.uid == userId &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['lastActiveAt', 'otpPromptShown', 'totpSecret', 'totpEnabled']))
+      );
+
+      allow delete: if isAdminLevel();
+    }
+
+    // ---------------------------------------------------------------------
+    // Username -> {email, uid} lookup. Public and minimal by design — see
+    // the comment above findEmailByUsername() in lib/auth.js for why this
+    // collection exists at all: a signed-out visitor has to resolve their
+    // username to an email before they can call
+    // signInWithEmailAndPassword, and that used to be done by listing the
+    // full /users collection, which handed over each matching document's
+    // ENTIRE content (including totpSecret) to anyone who knew a username.
+    // This mirror holds nothing but {email, uid} per username, so reading
+    // one is harmless; it's kept in sync with the real /users doc by
+    // register()/updateUser() writing both in the same batch.
+    // ---------------------------------------------------------------------
+
+    match /usernames/{username} {
+      allow get:  if true;
+      allow list: if false;
+      // Mirrors who may create/rename a /users/{uid} doc: the bootstrap
+      // first Admin creating their own account, or an existing Admin-level
+      // user managing employees (Settings > Employees). Tying this to
+      // request.resource.data.uid == request.auth.uid for the bootstrap
+      // case stops anyone from pre-claiming a username doc that points at
+      // someone else's uid before their own /users doc exists.
+      allow create: if isSignedIn() && (
+        (request.resource.data.uid == request.auth.uid && !bootstrapped()) || isAdminLevel() ||
+        // Self-heal (lib/auth.js: ensureUsernameMirror): a signed-in user may
+        // (re)create ONLY their own missing mirror doc — same uid, same auth
+        // email, and the username must match their own /users/{uid} profile.
+        (hasProfile() &&
+          request.resource.data.keys().hasOnly(['email', 'uid']) &&
+          request.resource.data.uid == request.auth.uid &&
+          request.resource.data.email.lower() == request.auth.token.email.lower() &&
+          me().username.lower() == username)
+      );
+      allow update, delete: if isAdminLevel();
+    }
+
+    // ---------------------------------------------------------------------
+    // Activity log — append-only audit trail (lib/auth.js: logActivity).
+    // Never updated or deleted by the app.
+    // ---------------------------------------------------------------------
+
+    match /activityLog/{id} {
+      allow create: if hasProfile();
+      // Settings > History is one of the two Admin-level-only Settings
+      // sub-tabs (see PERMISSION_MODULES comment in lib/permissions.js).
+      allow read:   if isAdminLevel();
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Default deny — anything not explicitly matched above.
+    // ---------------------------------------------------------------------
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
