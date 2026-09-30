@@ -14,13 +14,11 @@ import ResetNumberingPanel from "@/components/ResetNumberingPanel";
 import {
   collection,
   onSnapshot,
-  getDocs,
   doc,
   getDoc,
   addDoc,
   updateDoc,
   deleteDoc,
-  writeBatch,
   query,
   where,
 } from "firebase/firestore";
@@ -50,7 +48,6 @@ import {
   UserCog,
   ShieldAlert,
   Loader2,
-  RefreshCw,
 } from "lucide-react";
 import * as OTPAuth from "otpauth";
 import QRCode from "qrcode";
@@ -70,7 +67,6 @@ export default function SettingsPage() {
     canAccessModule,
     register,
     updateUser,
-    backfillUsernameIndex,
     verifyTOTP,
     generateTOTPSecret,
     enable2FA,
@@ -83,8 +79,6 @@ export default function SettingsPage() {
   } = useAuth();
 
   const [activeTab, setActiveTab] = useState("myAccount");
-  const [repairingUsernames, setRepairingUsernames] = useState(false);
-  const [repairingOwnership, setRepairingOwnership] = useState(false);
 
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -254,56 +248,6 @@ export default function SettingsPage() {
   // act on this one, mirroring the same select-a-row-then-act pattern used
   // in Flights/Hotels/Visa/Transportation.
   const selectedEmployee = filteredUsers.find((u) => u.id === selectedEmployeeId) || null;
-
-  // One-time migration helper: bookings created before salesmanUid existed
-  // have none, so "Only see my own bookings" (userData.onlyOwnData) falls
-  // back — both in the UI and in firestore.rules' ownsBooking() — to
-  // matching salesmanName against the employee's own name. That fallback
-  // is a reasonable stopgap but not exact: it silently mismatches if an
-  // employee's name was ever edited after they made those old bookings,
-  // and it's genuinely ambiguous if two employees ever shared the same
-  // name. This fills in the real salesmanUid wherever the match is
-  // unambiguous (exactly one employee has that name) across all four
-  // booking sections, and reports how many it could and couldn't resolve
-  // so the rest can be checked by hand rather than guessed at.
-  const backfillSalesmanUid = async () => {
-    const usersSnap = await getDocs(collection(db, "users"));
-    const nameCount = {};
-    const nameToUid = {};
-    usersSnap.docs.forEach((d) => {
-      const name = (d.data().name || "").trim();
-      if (!name) return;
-      nameCount[name] = (nameCount[name] || 0) + 1;
-      nameToUid[name] = d.id;
-    });
-
-    const SECTIONS = ["flights", "hotels", "visa", "transportation"];
-    let fixed = 0, ambiguous = 0, unmatched = 0;
-    for (const section of SECTIONS) {
-      const snap = await getDocs(collection(db, section));
-      const toFix = [];
-      snap.docs.forEach((d) => {
-        const data = d.data();
-        if (data.salesmanUid) return; // already has one — nothing to do
-        const name = (data.salesmanName || "").trim();
-        if (!name) { unmatched += 1; return; }
-        if (nameCount[name] === 1) {
-          toFix.push({ id: d.id, uid: nameToUid[name] });
-        } else if (nameCount[name] > 1) {
-          ambiguous += 1; // two+ employees share this name — can't tell which one
-        } else {
-          unmatched += 1; // no employee currently has this name
-        }
-      });
-      for (let i = 0; i < toFix.length; i += 500) {
-        const batch = writeBatch(db);
-        toFix.slice(i, i + 500).forEach(({ id, uid }) => batch.update(doc(db, section, id), { salesmanUid: uid }));
-        await batch.commit();
-      }
-      fixed += toFix.length;
-    }
-    return { fixed, ambiguous, unmatched };
-  };
 
   // ---------- Add Employee ----------
   const handleAdd = async (e) => {
@@ -903,50 +847,6 @@ export default function SettingsPage() {
                 <p className="text-sm text-gray-500">{filteredUsers.length} users • Manage accounts, roles & 2FA</p>
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  onClick={async () => {
-                    setRepairingUsernames(true);
-                    try {
-                      const n = await backfillUsernameIndex();
-                      toast.success(n > 0 ? `Repaired ${n} username login${n === 1 ? "" : "s"}` : "Username login index already up to date");
-                    } catch (e) {
-                      toast.error(e.message || "Failed");
-                    } finally {
-                      setRepairingUsernames(false);
-                    }
-                  }}
-                  disabled={repairingUsernames}
-                  title="One-time fix: creates the username-to-email lookup entry for any employee whose account predates it. Safe to run any time — only fills in what's missing."
-                  className="flex items-center gap-2 border border-gray-300 hover:bg-gray-50 text-gray-600 px-3 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50"
-                >
-                  <RefreshCw size={14} className={repairingUsernames ? "animate-spin" : ""} /> Repair Username Logins
-                </button>
-                <button
-                  onClick={async () => {
-                    setRepairingOwnership(true);
-                    try {
-                      const { fixed, ambiguous, unmatched } = await backfillSalesmanUid();
-                      if (fixed === 0 && ambiguous === 0) {
-                        toast.success("Booking ownership already up to date");
-                      } else {
-                        toast.success(
-                          `Fixed ${fixed} booking${fixed === 1 ? "" : "s"}` +
-                          (ambiguous ? ` · ${ambiguous} skipped (name shared by 2+ employees)` : "") +
-                          (unmatched ? ` · ${unmatched} skipped (no matching employee)` : "")
-                        );
-                      }
-                    } catch (e) {
-                      toast.error(e.message || "Failed");
-                    } finally {
-                      setRepairingOwnership(false);
-                    }
-                  }}
-                  disabled={repairingOwnership}
-                  title="One-time fix: fills in the real owner (salesmanUid) on old bookings that predate it, wherever the salesman's name unambiguously matches one current employee. Needed for 'Only see my own bookings' to work precisely on old records. Safe to run any time."
-                  className="flex items-center gap-2 border border-gray-300 hover:bg-gray-50 text-gray-600 px-3 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50"
-                >
-                  <RefreshCw size={14} className={repairingOwnership ? "animate-spin" : ""} /> Repair Booking Ownership
-                </button>
                 <div className="relative">
                   <Search className="absolute left-3 top-2.5 text-gray-400" size={16} />
                   <input

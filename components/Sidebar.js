@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import Image from "next/image";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth";
+import { subscribeCompanyProfile } from "@/lib/companyProfile";
 import { canAccessAnyModule, CRM_ROUTE_KEYS, SETTINGS_ROUTE_KEYS } from "@/lib/permissions";
 import CurrencyConverter from "@/components/CurrencyConverter";
 import {
@@ -40,6 +41,14 @@ export default function Sidebar() {
   const pathname = usePathname();
   const { userData, logout, canAccessModule, isAdmin, appFeatures } = useAuth();
 
+  // Company name + logo come from Settings -> Company Profile, so each
+  // company that deploys this app sees its own branding.
+  const [brand, setBrand] = useState({ name: "", logoUrl: "" });
+  useEffect(() => {
+    const unsub = subscribeCompanyProfile((p) => setBrand({ name: p.name || "", logoUrl: p.logoUrl || "" }));
+    return () => unsub();
+  }, []);
+
   // First letter of the first two words of the employee's name — "Fady
   // Habib" -> "FH". Falls back to "TA" if no name is available yet (e.g.
   // still loading, or an older account with no `name` field).
@@ -53,17 +62,18 @@ export default function Sidebar() {
 
   return (
     <aside className="fixed top-0 left-0 z-40 w-64 h-screen bg-slate-800 text-white flex flex-col">
-      {/* Brand logo */}
-      <div className="flex justify-center pt-5 pb-1 px-6">
-        <Image
-          src="/athena-logo.png"
-          alt="Athena Tech"
-          width={480}
-          height={292}
-          className="w-full max-w-[170px] h-auto"
-          priority
-        />
-      </div>
+      {/* Brand logo — the company's own logo from Settings -> Company Profile
+          (nothing is shown until one has been uploaded). */}
+      {brand.logoUrl ? (
+        <div className="flex justify-center pt-5 pb-1 px-6">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={brand.logoUrl}
+            alt={brand.name || "Company logo"}
+            className="w-full max-w-[170px] max-h-[110px] h-auto object-contain"
+          />
+        </div>
+      ) : null}
 
       {/* Logo */}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700">
@@ -71,7 +81,7 @@ export default function Sidebar() {
           {initials}
         </div>
         <div>
-          <h1 className="font-semibold text-sm leading-tight">Travel Agency Management</h1>
+          <h1 className="font-semibold text-sm leading-tight">{brand.name || "Travel Agency Management"}</h1>
           {userData?.role && userData.role !== "Employee" ? (
             <p className="text-xs text-slate-400">{userData.role}</p>
           ) : null}

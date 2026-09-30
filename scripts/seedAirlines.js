@@ -1,37 +1,30 @@
 /**
  * One-time seed script for airline suppliers
- * Usage: node scripts/seedAirlines.js
- * Requires Firebase config – uses same project as lib/firebase.js
- * Note: Firestore rules require authenticated writes in production. If unauthenticated write is blocked,
- * use the UI "Import Airlines" button while logged in as Admin (recommended).
- *
- * IMPORTANT: this used to hardcode a DIFFERENT Firebase project
- * ("grok-8992c") than the rest of the app ("travel-agency-managment" in
- * lib/firebase.js) — running it would have silently seeded airline data
- * into an unrelated project instead of this app's own database, and did
- * nothing useful here. Fixed to match lib/firebase.js's project by
- * default. Can't just `require("../lib/firebase")` — that file is an ES
- * module meant to be bundled by Next.js, and this is a plain CommonJS
- * script — so the values are duplicated here; keep the two in sync if
- * you ever change Firebase projects. Override via env vars (matching
- * .env.local.example) for a different deployment, e.g.:
- *   node --env-file=.env.local scripts/seedAirlines.js
- * (plain `node`, unlike `next dev`/`next build`, does not auto-load
- * .env.local — the --env-file flag, or your own `export`, is required
- * for the env vars below to actually take effect.)
+ * Usage: node --env-file=.env.local scripts/seedAirlines.js
+ * Uses the same NEXT_PUBLIC_FIREBASE_* variables as the app (see
+ * .env.local.example) — there is deliberately no hardcoded project, so it can
+ * never seed the wrong company's database by accident. Plain `node`, unlike
+ * `next dev`, does not auto-load .env.local, hence the --env-file flag.
+ * Note: Firestore rules require authenticated writes in production. If an
+ * unauthenticated write is blocked, use the UI "Import Airlines" button while
+ * logged in as Admin (recommended).
  */
 
 const { initializeApp, getApps } = require("firebase/app");
 const { getFirestore, collection, getDocs, addDoc, serverTimestamp } = require("firebase/firestore");
 
 const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "AIzaSyCTIaRUilmtj70hZj9P7GxDbnsHBhp_vv0",
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN || "travel-agency-managment.firebaseapp.com",
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || "travel-agency-managment",
-  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET || "travel-agency-managment.firebasestorage.app",
-  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID || "1091168441758",
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID || "1:1091168441758:web:7cb5a00a3559d2fd1eb28f",
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
+if (!firebaseConfig.projectId || !firebaseConfig.apiKey) {
+  console.error("Missing NEXT_PUBLIC_FIREBASE_* variables. Run: node --env-file=.env.local scripts/seedAirlines.js");
+  process.exit(1);
+}
 
 const AIRLINE_CODES = {
   "077": { carrier: "MS", name: "EgyptAir", gds: "1A" },

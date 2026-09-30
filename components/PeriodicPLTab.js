@@ -7,9 +7,6 @@
  * lib/financialReports.js): quarterly and yearly are sums of monthly, so
  * they can never disagree with each other. The small badge under the
  * period switcher is a visible proof of that (reconciles()).
- *
- * `t` is passed down from accounts/page.js's useLanguage() — see the
- * accounts.plPeriodic.* keys in locales/ar.json / locales/en.json.
  */
 
 import { useMemo, useState } from "react";
@@ -18,13 +15,13 @@ import { fmtMoney as fmt } from "@/lib/bookingNormalize";
 import { openPrintWindow } from "@/lib/helpers";
 import { CheckCircle2, XCircle, Printer } from "lucide-react";
 
-export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
-  const VIEWS = [
-    { id: "monthly", label: t("accounts.plPeriodic.monthly") },
-    { id: "quarterly", label: t("accounts.plPeriodic.quarterly") },
-    { id: "yearly", label: t("accounts.plPeriodic.yearly") },
-  ];
+const VIEWS = [
+  { id: "monthly", label: "شهري" },
+  { id: "quarterly", label: "ربع سنوي" },
+  { id: "yearly", label: "سنوي" },
+];
 
+export default function PeriodicPLTab({ ledgerLines, chartOfAccounts }) {
   const [view, setView] = useState("monthly");
   const [yearFilter, setYearFilter] = useState("all");
 
@@ -60,16 +57,16 @@ export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
   const handlePrint = () => {
     const viewLabel = VIEWS.find((v) => v.id === view)?.label || "";
     const body = `
-      <h2>${t("accounts.tabs.pl")} — ${viewLabel}${yearFilter !== "all" ? " — " + yearFilter : ""}</h2>
-      <div class="sub">${new Date().toLocaleString()}</div>
+      <h2>تقرير الربح والخسارة — ${viewLabel}${yearFilter !== "all" ? " — " + yearFilter : ""}</h2>
+      <div class="sub">تم إصداره في ${new Date().toLocaleString("ar-EG")}</div>
       <table>
-        <tr><th>${t("accounts.plPeriodic.period")}</th><th style="text-align:right">${t("accounts.plPeriodic.revenue")}</th><th style="text-align:right">${t("accounts.plPeriodic.cogs")}</th><th style="text-align:right">${t("accounts.plPeriodic.grossProfit")}</th><th style="text-align:right">${t("accounts.plPeriodic.expenses")}</th><th style="text-align:right">${t("accounts.plPeriodic.netIncome")}</th></tr>
+        <tr><th>الفترة</th><th style="text-align:right">الإيرادات</th><th style="text-align:right">تكلفة المبيعات</th><th style="text-align:right">مجمل الربح</th><th style="text-align:right">المصروفات</th><th style="text-align:right">صافي الربح/الخسارة</th></tr>
         ${rows
           .map(
             (r) => `<tr><td>${r.label}</td><td style="text-align:right">${fmt(r.revenue)}</td><td style="text-align:right">${fmt(r.cogs)}</td><td style="text-align:right">${fmt(r.grossProfit)}</td><td style="text-align:right">${fmt(r.expenses)}</td><td style="text-align:right">${fmt(r.netIncome)}</td></tr>`
           )
           .join("")}
-        <tr style="font-weight:bold"><td>${t("accounts.plPeriodic.total")}</td><td style="text-align:right">${fmt(grandTotal.revenue)}</td><td style="text-align:right">${fmt(grandTotal.cogs)}</td><td style="text-align:right">${fmt(grandTotal.grossProfit)}</td><td style="text-align:right">${fmt(grandTotal.expenses)}</td><td style="text-align:right">${fmt(grandTotal.netIncome)}</td></tr>
+        <tr style="font-weight:bold"><td>الإجمالي</td><td style="text-align:right">${fmt(grandTotal.revenue)}</td><td style="text-align:right">${fmt(grandTotal.cogs)}</td><td style="text-align:right">${fmt(grandTotal.grossProfit)}</td><td style="text-align:right">${fmt(grandTotal.expenses)}</td><td style="text-align:right">${fmt(grandTotal.netIncome)}</td></tr>
       </table>
     `;
     openPrintWindow(`P&L - ${viewLabel}`, body);
@@ -91,21 +88,21 @@ export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
             ))}
           </div>
           <select value={yearFilter} onChange={(e) => setYearFilter(e.target.value)} className="border rounded px-2 py-1 text-xs">
-            <option value="all">{t("accounts.plPeriodic.allYears")}</option>
+            <option value="all">كل السنوات</option>
             {years.map((y) => (
               <option key={y} value={y}>{y}</option>
             ))}
           </select>
           <span
-            title={t("accounts.plPeriodic.consistencyNote")}
+            title="يثبت أن مجموع الشهور = مجموع السنوات (تطابق مضمون هيكليًا)"
             className={`inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-full ${isReconciled ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}
           >
             {isReconciled ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-            {isReconciled ? t("accounts.plPeriodic.reconciled") : t("accounts.plPeriodic.notReconciled")}
+            {isReconciled ? "الأرقام متطابقة بين كل المستويات" : "تعارض في الأرقام!"}
           </span>
         </div>
         <button onClick={handlePrint} className="inline-flex items-center gap-1 px-3 py-1.5 border rounded text-xs">
-          <Printer size={12} /> {t("accounts.treasury.print")}
+          <Printer size={12} /> طباعة
         </button>
       </div>
 
@@ -113,13 +110,13 @@ export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
         <table className="w-full text-[11px]">
           <thead className="bg-slate-50 text-slate-500">
             <tr>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.period")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.revenue")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.cogs")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.grossProfit")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.expenses")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.netIncome")}</th>
-              <th className="text-right px-3 py-1.5">{t("accounts.plPeriodic.margin")}</th>
+              <th className="text-right px-3 py-1.5">الفترة</th>
+              <th className="text-right px-3 py-1.5">الإيرادات</th>
+              <th className="text-right px-3 py-1.5">تكلفة المبيعات</th>
+              <th className="text-right px-3 py-1.5">مجمل الربح</th>
+              <th className="text-right px-3 py-1.5">المصروفات</th>
+              <th className="text-right px-3 py-1.5">صافي الربح/الخسارة</th>
+              <th className="text-right px-3 py-1.5">الهامش %</th>
             </tr>
           </thead>
           <tbody>
@@ -135,13 +132,13 @@ export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
               </tr>
             ))}
             {rows.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">{t("accounts.plPeriodic.noData")}</td></tr>
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">لا توجد بيانات</td></tr>
             )}
           </tbody>
           {rows.length > 0 && (
             <tfoot>
               <tr className="border-t-2 bg-slate-50 font-bold">
-                <td className="px-3 py-1.5">{t("accounts.plPeriodic.total")}</td>
+                <td className="px-3 py-1.5">الإجمالي</td>
                 <td className="px-3 py-1.5 text-right tabular-nums">{fmt(grandTotal.revenue)}</td>
                 <td className="px-3 py-1.5 text-right tabular-nums">{fmt(grandTotal.cogs)}</td>
                 <td className="px-3 py-1.5 text-right tabular-nums">{fmt(grandTotal.grossProfit)}</td>
@@ -154,7 +151,7 @@ export default function PeriodicPLTab({ ledgerLines, chartOfAccounts, t }) {
         </table>
       </div>
       <p className="text-[10px] text-slate-400">
-        {t("accounts.plPeriodic.consistencyNote")}
+        الربع سنوي = مجموع 3 شهور بالظبط، والسنوي = مجموع أرباعه — مفيش حساب منفصل ممكن يختلف عن التاني.
       </p>
     </div>
   );

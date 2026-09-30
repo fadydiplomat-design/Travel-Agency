@@ -2,9 +2,8 @@
 
 import { useState, useEffect, useMemo, useRef } from "react";
 import Navbar from "@/components/Navbar";
-import { useAuth } from "@/lib/auth";
+import { useAuth, logActivity } from "@/lib/auth";
 import { canWriteModule } from "@/lib/permissions";
-import { useLanguage } from "@/lib/i18n";
 import ExportButtons from "@/components/ExportButtons";
 import TreasuryTab from "@/components/TreasuryTab";
 import PeriodicPLTab from "@/components/PeriodicPLTab";
@@ -162,33 +161,28 @@ const CHART_OF_ACCOUNTS = [
   { code: "6900", name: "General & Administrative", type: "Expense" },
 ];
 
-// `label` here is an English fallback only (used if a translation key is
-// ever missing — see useLanguage()'s t(), which returns the raw key
-// string in that case, not a blank). The actual rendered text always
-// comes from t(tb.labelKey) at render time below, so the tab bar follows
-// the app's language switch like every other translated page.
 const TABS = [
-  { id: "overview", label: "Dashboard", labelKey: "accounts.tabs.overview", icon: PieChart },
-  { id: "pl", label: "P&L", labelKey: "accounts.tabs.pl", icon: BookOpen },
-  { id: "plPeriods", label: "P&L Periodic", labelKey: "accounts.tabs.plPeriods", icon: BookOpen },
-  { id: "adjustments", label: "Adjustments", labelKey: "accounts.tabs.adjustments", icon: AlertTriangle },
-  { id: "trialBalance", label: "Trial Balance", labelKey: "accounts.tabs.trialBalance", icon: Calculator },
-  { id: "gl", label: "General Ledger", labelKey: "accounts.tabs.gl", icon: BookOpen },
-  { id: "balanceSheet", label: "Balance Sheet", labelKey: "accounts.tabs.balanceSheet", icon: Landmark },
-  { id: "clients", label: "Clients AR", labelKey: "accounts.tabs.clients", icon: Users },
-  { id: "suppliers", label: "Suppliers AP", labelKey: "accounts.tabs.suppliers", icon: Building2 },
-  { id: "cash", label: "Cash & Card", labelKey: "accounts.tabs.cash", icon: Banknote },
-  { id: "treasury", label: "Treasury", labelKey: "accounts.tabs.treasury", icon: Wallet },
-  { id: "bank", label: "Bank Book", labelKey: "accounts.tabs.bank", icon: Landmark },
-  { id: "credits", label: "Credit Notes", labelKey: "accounts.tabs.credits", icon: ArrowLeftRight },
-  { id: "cancelled", label: "Cancelled Invoices", labelKey: "accounts.tabs.cancelled", icon: Ban },
-  { id: "vat", label: "VAT", labelKey: "accounts.tabs.vat", icon: Percent },
-  { id: "coa", label: "Chart of Accounts", labelKey: "accounts.tabs.coa", icon: ListTree },
-  { id: "journal", label: "Journals", labelKey: "accounts.tabs.journal", icon: BookOpen },
-  { id: "salesman", label: "Sales Team", labelKey: "accounts.tabs.salesman", icon: UserCheck },
-  { id: "currency", label: "Currency", labelKey: "accounts.tabs.currency", icon: Globe2 },
-  { id: "sections", label: "Products", labelKey: "accounts.tabs.sections", icon: Filter },
-  { id: "ledger", label: "Sales Ledger", labelKey: "accounts.tabs.ledger", icon: Receipt },
+  { id: "overview", label: "Dashboard", icon: PieChart },
+  { id: "pl", label: "P&L", icon: BookOpen },
+  { id: "plPeriods", label: "P&L الدوري (شهري/ربعي/سنوي)", icon: BookOpen },
+  { id: "adjustments", label: "التسويات", icon: AlertTriangle },
+  { id: "trialBalance", label: "Trial Balance", icon: Calculator },
+  { id: "gl", label: "General Ledger", icon: BookOpen },
+  { id: "balanceSheet", label: "Balance Sheet", icon: Landmark },
+  { id: "clients", label: "Clients AR", icon: Users },
+  { id: "suppliers", label: "Suppliers AP", icon: Building2 },
+  { id: "cash", label: "Cash & Card", icon: Banknote },
+  { id: "treasury", label: "الخزينة", icon: Wallet },
+  { id: "bank", label: "Bank Book", icon: Landmark },
+  { id: "credits", label: "Credit Notes", icon: ArrowLeftRight },
+  { id: "cancelled", label: "Cancelled Invoices", icon: Ban },
+  { id: "vat", label: "VAT", icon: Percent },
+  { id: "coa", label: "Chart of Accounts", icon: ListTree },
+  { id: "journal", label: "Journals", icon: BookOpen },
+  { id: "salesman", label: "Sales Team", icon: UserCheck },
+  { id: "currency", label: "Currency", icon: Globe2 },
+  { id: "sections", label: "Products", icon: Filter },
+  { id: "ledger", label: "Sales Ledger", icon: Receipt },
 ];
 
 function StatCard({ label, value, color, sub, icon: Icon, suffix = "EGP" }) {
@@ -224,7 +218,6 @@ const EMPTY_JOURNAL = {
 
 export default function AccountsPage() {
   const { userData, activeBranch, myBranches, isAdmin: authIsAdmin, canAccessModule, appFeatures } = useAuth();
-  const { t } = useLanguage();
   const closedYearKeys = useClosedFiscalYearKeys();
   // Was a hard-coded role list, which quietly ignored Settings > Employees >
   // Permissions: an employee explicitly granted Accounts saw the sidebar
@@ -532,17 +525,45 @@ export default function AccountsPage() {
           sell: 0,
           count: 0,
           refundBuy: 0,
+          // Per-transaction cost + age, kept only to compute the aging
+          // buckets below — not rendered directly.
+          txns: [],
         };
       }
       map[key].buy += r.buy;
       map[key].sell += r.sell;
       map[key].count += 1;
       if (r.isRefund) map[key].refundBuy += Math.abs(r.buy);
+      else map[key].txns.push({ buy: Math.max(0, r.buy), ageDays: r.ageDays });
     });
     Object.values(map).forEach((s) => {
       const key = s.code || s.name;
       s.paid = apPaymentsBySupplier[key] || 0;
       s.outstanding = s.buy - s.paid;
+
+      // Aging for AP — same buckets/colors as the Clients/AR tab, which
+      // already had this. Supplier payments (from Bank Book) are tracked
+      // per-supplier only, not matched to one specific bill, so there's
+      // no "this payment settled that exact transaction" data to read.
+      // Standard AP-aging practice in that situation: allocate the total
+      // paid amount against the OLDEST transactions first (a supplier
+      // pays down what they've owed longest before newer bills), then
+      // whatever's left unpaid on each transaction lands in its own age
+      // bucket. This is an allocation approximation, not a ledger of
+      // which payment cleared which bill — worth knowing if a supplier
+      // ever asks "which specific invoice was this payment for".
+      s.aging = { current: 0, d30: 0, d60: 0, d90: 0, d90p: 0 };
+      const oldestFirst = [...s.txns].sort((a, b) => b.ageDays - a.ageDays);
+      let remainingPayment = s.paid;
+      oldestFirst.forEach((t) => {
+        let owed = t.buy;
+        if (remainingPayment > 0) {
+          const applied = Math.min(remainingPayment, owed);
+          owed -= applied;
+          remainingPayment -= applied;
+        }
+        if (owed > 0.01) s.aging[agingBucket(t.ageDays)] += owed;
+      });
     });
     return Object.values(map).sort((a, b) => b.outstanding - a.outstanding);
   }, [filtered, apPaymentsBySupplier]);
@@ -879,7 +900,7 @@ export default function AccountsPage() {
     }
     setJournalSaving(true);
     try {
-      await addDoc(collection(db, "journalEntries"), {
+      const journalDoc = await addDoc(collection(db, "journalEntries"), {
         date: journalForm.date,
         memo: journalForm.memo.trim(),
         lines: journalForm.lines.map((l) => ({
@@ -896,6 +917,19 @@ export default function AccountsPage() {
         createdBy: userData?.name || userData?.username || "",
         createdAt: serverTimestamp(),
       });
+      // Audit trail: logActivity() already exists (see lib/auth.js) and is
+      // wired into Settings (employee edits, force-logout...) but wasn't
+      // called from a single financial action anywhere in the app — a
+      // manually-posted journal entry left no trace of who posted it
+      // beyond the journalEntries doc itself, which isn't visible from the
+      // Activity Log screen. This makes it show up there too.
+      logActivity({
+        userId: userData?.uid,
+        username: userData?.username,
+        name: userData?.name,
+        action: "journal_entry_posted",
+        meta: { journalId: journalDoc.id, date: journalForm.date, memo: journalForm.memo.trim(), totalDebit: journalTotals.debit },
+      });
       toast.success("Journal entry posted");
       setShowJournal(false);
       setJournalForm(EMPTY_JOURNAL);
@@ -910,7 +944,18 @@ export default function AccountsPage() {
     if (!canWrite) return;
     if (!confirm("Delete this journal entry?")) return;
     try {
+      // Capture what's being deleted BEFORE it's gone, so the audit trail
+      // entry actually says something useful (amount, memo) rather than
+      // just an opaque doc id nobody can look up anymore.
+      const existing = journals.find((j) => j.id === id);
       await deleteDoc(doc(db, "journalEntries", id));
+      logActivity({
+        userId: userData?.uid,
+        username: userData?.username,
+        name: userData?.name,
+        action: "journal_entry_deleted",
+        meta: { journalId: id, date: existing?.date, memo: existing?.memo, totalDebit: existing?.totalDebit },
+      });
       toast.success("Deleted");
     } catch (e) {
       toast.error(e.message || "Delete failed");
@@ -1082,8 +1127,8 @@ export default function AccountsPage() {
           </span>
           <ExportButtons
             targetRef={tabContentRef}
-            filename={`Accounts_${TABS.find((tb) => tb.id === tab)?.label.replace(/\s+/g, "_") || tab}`}
-            title={`${TABS.find((tb) => tb.id === tab) ? t(TABS.find((tb) => tb.id === tab).labelKey) : "Accounts"}${dateFrom || dateTo ? `  (${dateFrom || "…"} → ${dateTo || "…"})` : ""}`}
+            filename={`Accounts_${TABS.find((t) => t.id === tab)?.label.replace(/\s+/g, "_") || tab}`}
+            title={`${TABS.find((t) => t.id === tab)?.label || "Accounts"}${dateFrom || dateTo ? `  (${dateFrom || "…"} → ${dateTo || "…"})` : ""}`}
           />
         </div>
       </div>
@@ -1102,7 +1147,7 @@ export default function AccountsPage() {
               }`}
             >
               <Icon size={11} />
-              {t(tb.labelKey)}
+              {tb.label}
             </button>
           );
         })}
@@ -1240,7 +1285,7 @@ export default function AccountsPage() {
 
             {/* P&L PERIODIC — monthly/quarterly/yearly, guaranteed to reconcile */}
             {tab === "plPeriods" && (
-              <PeriodicPLTab ledgerLines={allLedgerLinesFull} chartOfAccounts={CHART_OF_ACCOUNTS} t={t} />
+              <PeriodicPLTab ledgerLines={allLedgerLinesFull} chartOfAccounts={CHART_OF_ACCOUNTS} />
             )}
 
             {/* ADJUSTMENTS — suspense account + accrual/prepayment/reclass entries */}
@@ -1251,7 +1296,6 @@ export default function AccountsPage() {
                 chartOfAccounts={CHART_OF_ACCOUNTS}
                 canWrite={canWrite}
                 userName={userData?.name || userData?.username || ""}
-                t={t}
               />
             )}
 
@@ -1487,6 +1531,11 @@ export default function AccountsPage() {
                       <th className="text-right px-3 py-1.5">Docs</th>
                       <th className="text-right px-3 py-1.5">Cost (AP)</th>
                       <th className="text-right px-3 py-1.5">Paid</th>
+                      <th className="text-right px-3 py-1.5">Current</th>
+                      <th className="text-right px-3 py-1.5">1–30</th>
+                      <th className="text-right px-3 py-1.5">31–60</th>
+                      <th className="text-right px-3 py-1.5">61–90</th>
+                      <th className="text-right px-3 py-1.5">90+</th>
                       <th className="text-right px-3 py-1.5">Outstanding</th>
                       <th className="text-right px-3 py-1.5">Sales</th>
                       <th className="text-right px-3 py-1.5">Margin</th>
@@ -1504,6 +1553,11 @@ export default function AccountsPage() {
                         <td className="px-3 py-1.5 text-right tabular-nums">{s.count}</td>
                         <td className="px-3 py-1.5 text-right font-semibold tabular-nums">{fmt(s.buy)}</td>
                         <td className="px-3 py-1.5 text-right text-emerald-600 tabular-nums">{fmt(s.paid)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{fmt(s.aging.current)}</td>
+                        <td className="px-3 py-1.5 text-right text-amber-600 tabular-nums">{fmt(s.aging.d30)}</td>
+                        <td className="px-3 py-1.5 text-right text-orange-600 tabular-nums">{fmt(s.aging.d60)}</td>
+                        <td className="px-3 py-1.5 text-right text-red-500 tabular-nums">{fmt(s.aging.d90)}</td>
+                        <td className="px-3 py-1.5 text-right text-red-700 tabular-nums">{fmt(s.aging.d90p)}</td>
                         <td className={`px-3 py-1.5 text-right font-bold tabular-nums ${s.outstanding > 0 ? "text-amber-600" : "text-slate-400"}`}>{fmt(s.outstanding)}</td>
                         <td className="px-3 py-1.5 text-right text-emerald-700 tabular-nums">{fmt(s.sell)}</td>
                         <td className={`px-3 py-1.5 text-right font-semibold tabular-nums ${(s.sell - s.buy) >= 0 ? "text-teal-600" : "text-red-600"}`}>{fmt(s.sell - s.buy)}</td>
@@ -1513,7 +1567,7 @@ export default function AccountsPage() {
                   </tbody>
                 </table>
                 <p className="px-3 py-2 text-[10px] text-slate-400 border-t">
-                  &quot;Paid&quot; comes from Bank Book payments tagged to this supplier (Bank Book → Add Line → Contra Account: Accounts Payable). Click a row for the full statement.
+                  &quot;Paid&quot; comes from Bank Book payments tagged to this supplier (Bank Book → Add Line → Contra Account: Accounts Payable), allocated oldest-bill-first across aging buckets. Click a row for the full statement.
                 </p>
               </div>
             )}
@@ -1537,7 +1591,7 @@ export default function AccountsPage() {
             )}
 
             {/* TREASURY — أوامر/سندات التوريد والصرف + أرصدة الخزائن بكل عملة */}
-            {tab === "treasury" && <TreasuryTab canWrite={canWrite} t={t} />}
+            {tab === "treasury" && <TreasuryTab canWrite={canWrite} />}
 
             {/* BANK BOOK */}
             {tab === "bank" && (
