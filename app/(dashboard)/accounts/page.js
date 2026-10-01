@@ -6,6 +6,7 @@ import { useAuth, logActivity } from "@/lib/auth";
 import { canWriteModule } from "@/lib/permissions";
 import ExportButtons from "@/components/ExportButtons";
 import TreasuryTab from "@/components/TreasuryTab";
+import BankReconciliationTab from "@/components/BankReconciliationTab";
 import PeriodicPLTab from "@/components/PeriodicPLTab";
 import AdjustmentsTab from "@/components/AdjustmentsTab";
 import {
@@ -33,6 +34,7 @@ import toast from "react-hot-toast";
 import {
   Search,
   Calculator,
+  CheckCircle2,
   TrendingUp,
   TrendingDown,
   Wallet,
@@ -174,6 +176,7 @@ const TABS = [
   { id: "cash", label: "Cash & Card", icon: Banknote },
   { id: "treasury", label: "الخزينة", icon: Wallet },
   { id: "bank", label: "Bank Book", icon: Landmark },
+  { id: "reconcile", label: "Bank Reconciliation", icon: CheckCircle2 },
   { id: "credits", label: "Credit Notes", icon: ArrowLeftRight },
   { id: "cancelled", label: "Cancelled Invoices", icon: Ban },
   { id: "vat", label: "VAT", icon: Percent },
@@ -972,6 +975,7 @@ export default function AccountsPage() {
       await addDoc(collection(db, "bankBook"), {
         ...bankForm,
         amount: parseNum(bankForm.amount),
+        cleared: false, // set true once matched against a real bank statement line — see Bank Reconciliation tab / lib/bankReconciliation.js
         createdBy: userData?.name || "",
         createdAt: serverTimestamp(),
       });
@@ -1614,6 +1618,7 @@ export default function AccountsPage() {
                         <th className="text-left px-3 py-1.5">Memo</th>
                         <th className="text-right px-3 py-1.5">Amount</th>
                         <th className="text-center px-3 py-1.5">Curr</th>
+                        <th className="text-center px-3 py-1.5" title="Confirmed against an actual bank statement line — see Bank Reconciliation tab">Cleared</th>
                         <th className="w-10"></th>
                       </tr>
                     </thead>
@@ -1637,6 +1642,9 @@ export default function AccountsPage() {
                               {fmt(b.amount)}
                             </td>
                             <td className="px-3 py-1.5 text-center">{b.currency}</td>
+                            <td className="px-3 py-1.5 text-center">
+                              {b.cleared ? <CheckCircle2 size={13} className="inline text-emerald-600" /> : <span className="text-slate-300 text-[10px]">—</span>}
+                            </td>
                             <td className="px-2">
                               {canWrite && (
                                 <button onClick={() => deleteBankLine(b.id)} className="text-red-500 p-1"><Trash2 size={12} /></button>
@@ -1645,13 +1653,17 @@ export default function AccountsPage() {
                           </tr>
                         ))}
                       {bankLines.length === 0 && (
-                        <tr><td colSpan={9} className="px-4 py-8 text-center text-slate-400">No bank lines yet</td></tr>
+                        <tr><td colSpan={10} className="px-4 py-8 text-center text-slate-400">No bank lines yet</td></tr>
                       )}
                     </tbody>
                   </table>
                 </div>
               </div>
             )}
+
+            {/* BANK RECONCILIATION — import statement, match, prove the
+                books agree with the actual bank, not just assume they do */}
+            {tab === "reconcile" && <BankReconciliationTab bankLines={bankLines} canWrite={canWrite} />}
 
             {/* CREDITS */}
             {tab === "credits" && (

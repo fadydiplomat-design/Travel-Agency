@@ -376,6 +376,12 @@ service cloud.firestore {
       allow read:   if hasProfile() && canAccess('accounts');
       allow write:  if hasProfile() && canWrite('accounts');
     }
+    // Bank Reconciliation — imported statement lines (lib/bankReconciliation.js,
+    // components/BankReconciliationTab.js). Same module gate as bankBook.
+    match /bankStatementLines/{id} {
+      allow read:   if hasProfile() && canAccess('accounts');
+      allow write:  if hasProfile() && canWrite('accounts');
+    }
 
     // ---------------------------------------------------------------------
     // Treasury — أوامر/سندات التوريد والصرف (lib/treasury.js,
